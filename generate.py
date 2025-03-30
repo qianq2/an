@@ -1,32 +1,60 @@
+
 from model.model import CharLSTM
 from utils import TextPreprocessor
 from config import *
 import torch
-import random
 
-def generate_text(model, start_str, length=100, temperature=0.8):
+
+def generate_text(model, preprocessor, start_str, length=100, temperature=0.8):
+    """
+    生成文本
+    参数：
+        model: 训练好的模型
+        preprocessor: 数据预处理器
+        start_str: 起始字符串
+        length: 生成长度
+        temperature: 温度参数（>1更随机，<1更保守）
+    """
     model.eval()  # 切换为评估模式（关闭Dropout等）
-    chars = [c for c in start_str.lower()]
+    device = next(model.parameters()).device
+    # 处理起始字符串
+    chars = list(start_str)
+    if len(chars) < SEQ_LENGTH:
+        chars = ['<PAD>'] * (SEQ_LENGTH - len(chars)) + chars
+    else:
+        chars = chars[-SEQ_LENGTH]
     hidden = None  # 初始隐藏状态为None
+
     for _ in range(length):
-        # 取最后seq_length个字符作为输入
-        seq = chars[-SEQ_LENGTH:]
-        # 将字符转换为索引张量（形状：[1, seq_length]）
-        seq_tensor = torch.tensor([preprocessor.char_to_idx[c] for c in seq]).unsqueeze(0)
-        # 预测下一个字符的概率分布
+        # 编码当前序列
+        encoded = preprocessor.encode(chars)
+        x = torch.tensor(encoded, dtype=torch.long).unsqueeze(0).to(device)
+
+        # 预测下一个字符
         with torch.no_grad():  # 禁用梯度计算，节省内存
-            output, hidden = model(seq_tensor, hidden)
-        # 通过温度参数调整概率分布的平滑度
-        probs = torch.softmax(output / temperature, dim=1)
-        # 从概率分布中采样一个字符索引
+            output, hidden = model(x, hidden)
+        # 应用温度采样
+        probs = torch.softmax(output / temperature, dim=1).squeeze()
         next_char_idx = torch.multinomial(probs, 1).item()
-        chars.append(preprocessor.idx_to_char[next_char_idx])
-    return ''.join(chars)
+        chars.append(preprocessor.idx2char[next_char_idx])
+    # 解码并去除填充符
+    generated = ''.join(chars).replace('<PAD>', '')
+    return generated
 
-# 加载模型和预处理配置
-preprocessor = TextPreprocessor("data/西游记.txt")
-model = CharLSTM(vocab_size=len(preprocessor.chars))
-model.load_state_dict(torch.load("model/LSTM_model.pth"))
+if __name__ == "__main__":
+    # 加载模型和预处理配置
+    preprocessor = TextPreprocessor("data/西游记.txt", seq_length=SEQ_LENGTH)
+    model = CharLSTM(preprocessor.vocab_size)
+    model.load_state_dict(torch.load("model/best_model.pth", map_location='cpu'))
+    model = model.to('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 示例生成
-print(generate_text(model, start_str="猴哥", temperature=0.5))
+    # 示例生成
+    seed_text = "猴哥"
+    generated_text = generate_text(
+        model,
+        preprocessor,
+        start_str=seed_text,
+        temperature=0.7,
+        length=200
+    )
+    print("生成结果:\n" + generated_text)

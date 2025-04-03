@@ -2,7 +2,7 @@ import torch.nn as nn
 
 
 class CharLSTM(nn.Module):
-    def __init__(self, vocab_size, embedding_dim=256, hidden_dim=512, num_layers=1):
+    def __init__(self, vocab_size, embedding_dim=128, hidden_dim=256, num_layers=1):
         """
                 中文分字LSTM模型
                 参数：

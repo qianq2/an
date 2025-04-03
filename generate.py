@@ -1,60 +1,99 @@
 
-from model.model import CharLSTM
-from utils import TextPreprocessor
-from config import *
+from model.bert_model import Bert_Lite
+from utils.utils import TextPreprocessor
+from utils.config import Config
 import torch
+import re
 
+class Generate_text:
+    def __init__(self, model, preprocessor, config):
 
-def generate_text(model, preprocessor, start_str, length=100, temperature=0.8):
-    """
-    生成文本
-    参数：
-        model: 训练好的模型
-        preprocessor: 数据预处理器
-        start_str: 起始字符串
-        length: 生成长度
-        temperature: 温度参数（>1更随机，<1更保守）
-    """
-    model.eval()  # 切换为评估模式（关闭Dropout等）
-    device = next(model.parameters()).device
-    # 处理起始字符串
-    chars = list(start_str)
-    if len(chars) < SEQ_LENGTH:
-        chars = ['<PAD>'] * (SEQ_LENGTH - len(chars)) + chars
-    else:
-        chars = chars[-SEQ_LENGTH]
-    hidden = None  # 初始隐藏状态为None
+        self.model =model
+        self.preprocessor = preprocessor
+        self.config = config
+        self.model.eval()   # 设置为评估模式，关闭dropout等训练专用层
 
-    for _ in range(length):
-        # 编码当前序列
-        encoded = preprocessor.encode(chars)
-        x = torch.tensor(encoded, dtype=torch.long).unsqueeze(0).to(device)
+    def _prepare_input(self, text):
+        """ 输入预处理管道（保持与训练时一致的清洗逻辑）"""
+        # 保持与训练完全相同的字符过滤规则
+        kept_chars = r'\u4e00-\u9fa5，。！？、；：“”‘’（）【】…—～《》\n'
+        clean_text = re.sub(f'[^{kept_chars}0-9]', '', text)
+        # 数字标准化处理
+        clean_text = re.sub(r'\d+', '#NUM', clean_text)
 
-        # 预测下一个字符
-        with torch.no_grad():  # 禁用梯度计算，节省内存
-            output, hidden = model(x, hidden)
-        # 应用温度采样
-        probs = torch.softmax(output / temperature, dim=1).squeeze()
-        next_char_idx = torch.multinomial(probs, 1).item()
-        chars.append(preprocessor.idx2char[next_char_idx])
-    # 解码并去除填充符
-    generated = ''.join(chars).replace('<PAD>', '')
-    return generated
+        # 编码流程：添加CLS标记 + 实际编码
+        encoded = [self.preprocessor.char2idx['<CLS>']]      # 起始标记
+        encoded += self.preprocessor.encode(clean_text)      # 主体内容编码
+        return encoded
+
+    def generate(self, prompt, max_length=100, temperature=0.8, top_k=5):
+        """文本生成函数"""
+        current_ids = self._prepare_input(prompt)
+        sep_id = self.preprocessor.char2idx.get('<SEP>', -1)
+
+        for _ in range(max_length):
+            # 截断到模型最大长度
+            input_ids = current_ids[-(self.config.max_length - 1):]
+            attention_mask = [1] * len(input_ids)
+
+            # 转换为模型输入张量
+            input_tensor = torch.tensor([input_ids], dtype=torch.long)
+            mask_tensor = torch.tensor([attention_mask], dtype=torch.long)
+
+            # 模型推理
+            with torch.no_grad():
+                outputs = self.model(input_tensor, mask_tensor)
+
+            # 获取最后一个位置的logits并进行温度调节
+            logits = outputs[0][0, -1, :]  # 获取最后一个位置的logits
+            logits = logits / temperature
+
+            # Top-k筛选
+            if top_k > 0:
+                topk = torch.topk(logits, top_k)
+                logits = torch.full_like(logits, float('-inf'))
+                logits[topk.indices] = topk.values
+
+            # 概率采样
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1).item()
+
+            # 更新生成序列
+            current_ids.append(next_token)
+            if next_token == sep_id:
+                break
+
+        # 解码并去除特殊标记
+        generated = []
+        for idx in current_ids:
+            if idx == self.preprocessor.char2idx['<CLS>']:
+                continue
+            if idx == sep_id:
+                break
+            generated.append(idx)
+
+        return self.preprocessor.decode(generated)
+
 
 if __name__ == "__main__":
-    # 加载模型和预处理配置
-    preprocessor = TextPreprocessor("data/西游记.txt", seq_length=SEQ_LENGTH)
-    model = CharLSTM(preprocessor.vocab_size)
-    model.load_state_dict(torch.load("model/best_model.pth", map_location='cpu'))
-    model = model.to('cuda' if torch.cuda.is_available() else 'cpu')
+    config = Config()
+    preprocessor = TextPreprocessor(config)
 
-    # 示例生成
-    seed_text = "猴哥"
-    generated_text = generate_text(
-        model,
-        preprocessor,
-        start_str=seed_text,
-        temperature=0.7,
-        length=200
+    model = Bert_Lite(preprocessor.vocab_size, config)
+    model.load_state_dict(torch.load("model/trained_model/best_model.pth"))
+
+    # 创建生成器
+    generator = Generate_text(model, preprocessor, config)
+    # print("模型参数校验:", sum(p.numel() for p in model.parameters()))
+    # 生成示例
+    prompt = "悟空"
+    generated_text = generator.generate(
+        prompt,
+        max_length=100,
+        temperature=0.8,
+        top_k=50
     )
-    print("生成结果:\n" + generated_text)
+
+    print(f"Prompt: {prompt}")
+    print(f"生成语句: {generated_text}")
+

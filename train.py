@@ -1,40 +1,85 @@
-from model.model import CharLSTM
-from utils import TextPreprocessor
-from config import *
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import gradio as gr
-from torch.utils.data import DataLoader, TensorDataset
+from utils.config import Config
+from model.bert_model import Bert_Lite
+from utils.utils import TextPreprocessor
+from torch.utils.data import DataLoader, random_split
+#from model.model import CharLSTM
 
 
-# 数据加载与预处理
-preprocessor = TextPreprocessor("data/西游记.txt")
-sequences, targets = preprocessor.create_sequences()
-# 创建数据集和数据加载器（自动分批次）
-dataset = TensorDataset(sequences, targets)
-dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+class Trainer:
+    def __init__(self):
+        self.config = Config()
+        self.preprocessor = TextPreprocessor(self.config)
+        self.model = Bert_Lite(vocab_size=self.preprocessor.vocab_size,
+                               config=self.config).to(self.config.device)
+        self.optimizer = torch.optim.AdamW(
+            filter(lambda p:p.requires_grad, self.model.parameters()),
+            lr=self.config.learning_rate
+        )
+        self.scaler = torch.cuda.amp.GradScaler()
 
-# 模型初始化
-model = CharLSTM(vocab_size=len(preprocessor.chars))
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-criterion = nn.CrossEntropyLoss()  # 分类任务常用损失函数
+    def create_loader(self):
+        dataset = self.preprocessor.create_sequences()
+        train_size = int(0.9 * len(dataset))
+        train_dataset, val_dataset = random_split(dataset, [train_size, len(dataset) - train_size])
 
-# 训练循环
-for epoch in range(EPOCHS):
-    for batch, (x, y) in enumerate(dataloader):
-        optimizer.zero_grad()  # 清空梯度
-        output, _ = model(x)   # 前向传播
-        loss = criterion(output, y)  # 计算损失
-        loss.backward()        # 反向传播计算梯度
-        optimizer.step()       # 更新权重
-    print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
+        return (
+            DataLoader(train_dataset, batch_size=self.config.batch_size, shuffle=True),
+            DataLoader(val_dataset, batch_size=self.config.batch_size, shuffle=False)
+        )
+
+    def train_epoch(self, train_loader):
+        self.model.train()
+        total_loss = 0.0
+        for x, mask, y in train_loader:
+            x, mask, y = x.to(self.config.device), mask.to(self.config.device), y.to(self.config.device)
+            self.optimizer.zero_grad()
+
+            with torch.cuda.amp.autocast():
+                loss, _ = self.model(input_ids=x,
+                                     attention_mask=mask,
+                                     labels=y)
+
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            total_loss += loss.item()
+
+        return total_loss / len(train_loader)
+
+    def evaluate(self, val_loader):
+        self.model.eval()
+        total_loss = 0.0
+        with torch.no_grad():
+            for x, mask, y in val_loader:
+                x, mask, y = x.to(self.config.device), mask.to(self.config.device), y.to(self.config.device)
+                loss, _ = self.model(x, mask, y)
+                total_loss += loss.item()
+        return total_loss / len(val_loader)
 
 
+    def run(self):
+        train_loader, val_loader = self.create_loader()
+        best_loss = float('inf')
+        for epoch in range(self.config.epochs):
+            train_loss = self.train_epoch(train_loader)
+            val_loss = self.evaluate(val_loader)
+            print(f"Epoch {epoch+1:02d} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = model.to(device)
-x, y = x.to(device), y.to(device)
+            if val_loss < best_loss:
+                best_loss = val_loss
+                patience_counter = 0
+                torch.save(self.model.state_dict(), self.config.trained_model_patch)
+                print("模型已保存！")
 
-# 保存模型
-torch.save(model.state_dict(), "model/LSTM_model.pth")
+            else:
+                patience_counter += 1
+                if patience_counter >= self.config.patience:
+                    print(f"早停，第{epoch + 1}轮结束训练。")
+                    break
+        print("训练完成！最佳模型已保存至 model/trained_model/Bert_model.pth")
+
+
+if __name__ == "__main__":
+    trainer = Trainer()
+    trainer.run()
